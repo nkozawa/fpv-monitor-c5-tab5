@@ -24,7 +24,7 @@ PC 向け実装（[fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-mo
   - TAB 5 の **USB-A Host ポート** から ESP32-C5 モジュールに 5V 給電し、USB CDC-ACM 仮想シリアルで高速通信
 - **公式 ESP-SDR ファームウェアが必須**:
   - ESP32-C5 モジュールには公式 ESP-SDR ファームウェアの導入が必須です。生 I/Q データを USB 転送し、8192点 FFT・スティッチング・信号解析・UI描画をすべて TAB 5 (ESP32-P4 @ 400MHz) 側でリアルタイム実行します。
-  - （実験的サポート）FPV-LCD カスタムファームウェア（SWEEP ストリーム転送）接続時にも自動判別して動作可能です。LCD ファームウェアの詳細は [https://github.com/nkozawa/fpv-monitor-c5-tab5](https://github.com/nkozawa/fpv-monitor-c5-tab5) を参照してください。
+  - （実験的サポート）FPV-LCD カスタムファームウェア（SWEEP ストリーム転送）接続時にも自動判別して動作可能です。LCD ファームウェアの詳細は [https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5) を参照してください。
 
 ### 対応ハードウェア
 
@@ -42,7 +42,7 @@ ESP32-C5 モジュール（StampC5 または XIAO ESP32-C5）を本システム�
 2. ESP32-C5 を PC に USB 接続します（ブートボタンを押しながら接続してブートローダに入る必要がある場合があります）。
 3. サイト上の Web インストーラ（または提供されているファームウェアバイナリ）を使用し、**公式 ESP-SDR ファームウェア** に変更・書き込みを行います。
    > **注意**: ESP32-C5 側で FFT 計算を行うファームウェアではなく、**標準の公式 ESP-SDR ファームウェア（生 I/Q 転送モード）** を使用します。FFT やホップ合成処理はすべて処理能力の高い TAB 5 側で行われます。  
-   > ※ 実験的機能としての FPV-LCD ファームウェアの利用については、[https://github.com/nkozawa/fpv-monitor-c5-tab5](https://github.com/nkozawa/fpv-monitor-c5-tab5) を参照してください。
+   > ※ 実験的機能としての FPV-LCD ファームウェアの利用については、[https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5) を参照してください。
 
 ### ハードウェア接続と役割分担
 
@@ -111,7 +111,7 @@ It brings the full capabilities of the PC-based [fpv-band-monitor-c5](https://gi
   - Connected directly from TAB 5's **USB-A Host port** to the ESP32-C5 module via a standard USB-A to Type-C cable, supplying 5V power and high-speed CDC-ACM virtual serial communication
 - **Official ESP-SDR Firmware is Required**:
   - The ESP32-C5 module must be flashed with the official ESP-SDR firmware. It streams raw I/Q data over USB, and all 8192-point FFT, stitching, signal analysis, and UI rendering are computed on the TAB 5 (ESP32-P4 dual-core @ 400MHz).
-  - *(Experimental)* Automatically detects and supports FPV-LCD custom firmware (SWEEP stream mode). For details on the LCD firmware, please refer to [https://github.com/nkozawa/fpv-monitor-c5-tab5](https://github.com/nkozawa/fpv-monitor-c5-tab5).
+  - *(Experimental)* Automatically detects and supports FPV-LCD custom firmware (SWEEP stream mode). For details on the LCD firmware, please refer to [https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5).
 
 ### Supported Hardware
 
@@ -129,7 +129,7 @@ To use an ESP32-C5 module (StampC5 or XIAO ESP32-C5) with this project, you must
 2. Connect your ESP32-C5 module to your PC via USB (you may need to hold the Boot button while connecting to enter download mode).
 3. Use the online Web Flasher to flash the **official ESP-SDR firmware**.
    > **Note**: Do **not** use custom firmware that performs FFT on the ESP32-C5. Use the standard official ESP-SDR firmware (raw I/Q capture mode). All FFT and stitching computation is performed by the high-performance ESP32-P4 processor on TAB 5.  
-   > *Note: For experimental FPV-LCD firmware support, please refer to [https://github.com/nkozawa/fpv-monitor-c5-tab5](https://github.com/nkozawa/fpv-monitor-c5-tab5).*
+   > *Note: For experimental FPV-LCD firmware support, please refer to [https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5).*
 
 ### Hardware Connection & Architecture
 
