@@ -31,6 +31,7 @@ private:
     bool initialized_{false};
     bool touch_was_down_{false};
     bool waterfall_dirty_{false}; // ズーム変更後にウォーターフォールを一度クリアする
+    uint32_t last_waterfall_seq_{0}; // 新しいスイープが来た時だけウォーターフォールを進める
     int selected_channel_index_{-1}; // -1 = 4CH 全表示 (ALL), 0..3 = 単一チャンネル拡大
 
     // 画面レイアウト定数

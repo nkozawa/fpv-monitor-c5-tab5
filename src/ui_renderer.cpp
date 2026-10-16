@@ -156,9 +156,15 @@ void UiRenderer::render_header(const UiSharedState& state) {
     canvas_header.setTextColor(state.connected ? COLOR_GREEN_ON : 0xF800);
     canvas_header.drawString(status.c_str(), 480, 15);
 
-    // 受信モード
+    // 受信モード & スイープレート (FPS)
+    char rx_info[64];
+    if (state.connected && state.sweep_fps > 0.05f) {
+        snprintf(rx_info, sizeof(rx_info), "Rx: %s (%.1f fps)", state.rx_mode.c_str(), static_cast<double>(state.sweep_fps));
+    } else {
+        snprintf(rx_info, sizeof(rx_info), "Rx: %s", state.rx_mode.c_str());
+    }
     canvas_header.setTextColor(COLOR_TEXT_YELLOW);
-    canvas_header.drawRightString(("Rx: " + state.rx_mode).c_str(), GAIN_MINUS_X - 12, 15);
+    canvas_header.drawRightString(rx_info, GAIN_MINUS_X - 12, 15);
 
     // ゲイン調整ボタン (タップ可能であることを示すため枠付きで描く)
     const int text_y = GAIN_BTN_Y + 6;
@@ -371,14 +377,21 @@ void UiRenderer::render_waterfall(const UiSharedState& state) {
     if (waterfall_dirty_) {
         canvas_waterfall.fillScreen(COLOR_BG_DARK);
         waterfall_dirty_ = false;
+        last_waterfall_seq_ = 0;
         return;
     }
 
-    // 1行下へスクロール
-    canvas_waterfall.scroll(0, 1);
-
     const auto& powers = state.latest_frame.powers_db;
     if (powers.empty()) return;
+
+    // 新しいスイープデータが来ていない場合はウォーターフォールを進めない
+    if (state.latest_frame.seq == last_waterfall_seq_) {
+        return;
+    }
+    last_waterfall_seq_ = state.latest_frame.seq;
+
+    // 1行下へスクロール
+    canvas_waterfall.scroll(0, 1);
 
     float start_f = 0.0f;
     float stop_f = 0.0f;

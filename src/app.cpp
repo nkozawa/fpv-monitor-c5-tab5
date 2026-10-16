@@ -88,6 +88,9 @@ void run_raw_iq_mode(UsbHostSdrClient& client, DspStitcher& stitcher, UiSharedSt
     RxStats stats;
     uint32_t seq = 0;
     uint32_t last_log_ms = millis();
+    uint32_t last_fps_calc_ms = millis();
+    uint32_t sweeps_since_fps = 0;
+    float current_fps = 0.0f;
 
     while (client.is_connected()) {
         // ゲイン変更要求。USB 送信はブロッキングなのでロックの外で行う。
@@ -106,77 +109,77 @@ void run_raw_iq_mode(UsbHostSdrClient& client, DspStitcher& stitcher, UiSharedSt
             ESP_LOGW(TAG, "GAIN %d was not acknowledged", gain_value);
         }
 
-        bool hop_ok = true;
-        const char* fail_reason = "unknown";
+        bool all_hops_valid = true;
         for (size_t h = 0; h < stitcher.los().size(); ++h) {
             const int lo = stitcher.los()[h];
-            if (!ask(client, EspSdrProtocol::cmd_freq(lo), 200)) {
-                fail_reason = "FREQ no reply";
-                ++stats.fail_freq;
-                hop_ok = false;
-                break;
-            }
-
-            // CAP16: 8192 サンプル (80 MS/s) -> 16384 バイト
+            bool this_hop_ok = false;
             constexpr size_t n_bytes = static_cast<size_t>(CAP_SAMPLES) * 2;
-            if (!client.send_command(EspSdrProtocol::cmd_cap16(CAP_SAMPLES, 0))) {
-                fail_reason = "CAP16 send";
-                ++stats.fail_header;
-                hop_ok = false;
+
+            // PC 版 esp_sdr.py に準拠: ホップ単位で最大3回リトライ
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (attempt > 0) {
+                    client.synchronize(60);
+                }
+
+                if (!ask(client, EspSdrProtocol::cmd_freq(lo), 150)) {
+                    ++stats.fail_freq;
+                    continue;
+                }
+
+                if (!client.send_command(EspSdrProtocol::cmd_cap16(CAP_SAMPLES, 0))) {
+                    ++stats.fail_header;
+                    continue;
+                }
+
+                std::string data_hdr;
+                if (!client.read_line(data_hdr, 250)) {
+                    ++stats.fail_header;
+                    continue;
+                }
+
+                EspSdrProtocol::DataHeader dh;
+                if (!EspSdrProtocol::parse_data_header(data_hdr, dh)) {
+                    ++stats.fail_header;
+                    continue;
+                }
+
+                raw_buf.resize(n_bytes);
+                if (!client.read_bytes(raw_buf.data(), n_bytes, 350)) {
+                    ++stats.fail_payload;
+                    continue;
+                }
+
+                if (EspSdrProtocol::calculate_crc32(raw_buf.data(), n_bytes) != dh.crc32) {
+                    ++stats.fail_crc;
+                    continue;
+                }
+
+                if (!EspSdrProtocol::unpack_iq(raw_buf.data(), n_bytes, CAP_SAMPLES, 8, iq_samples)) {
+                    ++stats.fail_payload;
+                    continue;
+                }
+
+                stitcher.compute_hop_spectrum_db(iq_samples, hop_spectra[h]);
+                this_hop_ok = true;
                 break;
             }
 
-            std::string data_hdr;
-            if (!client.read_line(data_hdr, 500)) {
-                fail_reason = "DATA header timeout";
-                ++stats.fail_header;
-                hop_ok = false;
-                break;
+            if (!this_hop_ok) {
+                ++stats.resyncs;
+                if (hop_spectra[h].empty()) {
+                    // 初回などで過去データがない場合は全体やり直し
+                    all_hops_valid = false;
+                    ESP_LOGW(TAG, "hop %u (LO %d) initial fail - resyncing", (unsigned)h, lo);
+                    client.synchronize(80);
+                    break;
+                }
+                // 過去データがある場合は前回のホップスペクトラムを維持してスティッチングを継続
+                ESP_LOGW(TAG, "hop %u (LO %d) dropped after 3 attempts, keeping previous hop data",
+                         (unsigned)h, lo);
             }
-
-            EspSdrProtocol::DataHeader dh;
-            if (!EspSdrProtocol::parse_data_header(data_hdr, dh)) {
-                // 行がずれているとここにバイナリが混ざる。先頭 32 バイトだけ出す。
-                ESP_LOGW(TAG, "hop %u (LO %d): bad DATA header, %u bytes starting '%.32s'",
-                         (unsigned)h, lo, (unsigned)data_hdr.size(), data_hdr.c_str());
-                fail_reason = "bad DATA header";
-                ++stats.fail_header;
-                hop_ok = false;
-                break;
-            }
-
-            raw_buf.resize(n_bytes);
-            if (!client.read_bytes(raw_buf.data(), n_bytes, 500)) {
-                fail_reason = "payload timeout";
-                ++stats.fail_payload;
-                hop_ok = false;
-                break;
-            }
-
-            if (EspSdrProtocol::calculate_crc32(raw_buf.data(), n_bytes) != dh.crc32) {
-                fail_reason = "CRC mismatch";
-                ++stats.fail_crc;
-                hop_ok = false;
-                break;
-            }
-
-            if (!EspSdrProtocol::unpack_iq(raw_buf.data(), n_bytes, CAP_SAMPLES, 8, iq_samples)) {
-                fail_reason = "unpack";
-                ++stats.fail_payload;
-                hop_ok = false;
-                break;
-            }
-
-            stitcher.compute_hop_spectrum_db(iq_samples, hop_spectra[h]);
         }
 
-        if (!hop_ok) {
-            ++stats.resyncs;
-            ESP_LOGW(TAG, "hop failed (%s) - resync. crc=%u hdr=%u payload=%u freq=%u resync=%u overrun=%u",
-                     fail_reason, (unsigned)stats.fail_crc, (unsigned)stats.fail_header,
-                     (unsigned)stats.fail_payload, (unsigned)stats.fail_freq,
-                     (unsigned)stats.resyncs, (unsigned)client.overrun_count());
-            client.synchronize(500);
+        if (!all_hops_valid) {
             continue;
         }
 
@@ -205,23 +208,32 @@ void run_raw_iq_mode(UsbHostSdrClient& client, DspStitcher& stitcher, UiSharedSt
         auto measurements = ChannelAnalysis::measure_all(
             frame.powers_db, frame.start_mhz, frame.bin_hz, state.active_channels);
 
+        ++stats.sweeps;
+        ++sweeps_since_fps;
+        const uint32_t now = millis();
+        if (now - last_fps_calc_ms >= 1000) {
+            current_fps = static_cast<float>(sweeps_since_fps) * 1000.0f / (now - last_fps_calc_ms);
+            sweeps_since_fps = 0;
+            last_fps_calc_ms = now;
+        }
+
         {
             std::lock_guard<std::mutex> lock(state.mtx);
             state.latest_frame = std::move(frame);
             state.measurements = std::move(measurements);
+            state.sweep_fps = current_fps;
         }
 
-        ++stats.sweeps;
-        const uint32_t now = millis();
         if (now - last_log_ms >= 2000) {
-            ESP_LOGI(TAG, "sweeps=%u bins=%u/%u peak=%.1f dBFS @ %.3f MHz (crc=%u resync=%u overrun=%u)",
-                     (unsigned)stats.sweeps, (unsigned)valid_bins,
+            ESP_LOGI(TAG, "sweeps=%u (%.1f fps) bins=%u/%u peak=%.1f dBFS @ %.3f MHz (crc=%u resync=%u overrun=%u)",
+                     (unsigned)stats.sweeps, (double)current_fps, (unsigned)valid_bins,
                      (unsigned)stitcher.output_bins(), (double)peak_db, (double)peak_f,
                      (unsigned)stats.fail_crc, (unsigned)stats.resyncs,
                      (unsigned)client.overrun_count());
             last_log_ms = now;
         }
     }
+
 }
 
 // パターン2: 液晶版 FPV-LCD ファームウェア (FFT 済み SWEEP ストリームを受信)

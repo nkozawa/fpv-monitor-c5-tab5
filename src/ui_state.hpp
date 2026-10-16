@@ -12,6 +12,7 @@ struct UiSharedState {
     std::string device_info{"Waiting for StampC5..."};
     std::string rx_mode{"auto -> iq"};
     int current_gain{25};
+    float sweep_fps{0.0f};
 
     SweepFrame latest_frame;
     std::vector<ChannelMeasurement> measurements;

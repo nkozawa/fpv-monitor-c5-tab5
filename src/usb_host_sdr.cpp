@@ -10,6 +10,7 @@
 #include <EspUsbHost.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #endif
 
 namespace vtxmon {
@@ -26,8 +27,8 @@ constexpr uint32_t SDR_BAUD = 2000000;
 
 // CAP16 は 1 ホップあたり 16384 バイトを一気に送ってくる。
 // EspUsbHostCdcSerial の既定リング (512 B) では取りこぼすため、
-// onSerialData を直接受けて自前のリングに memcpy する。
-constexpr size_t RX_RING_BYTES = 64 * 1024;
+// onSerialData を直接受けて自前の大容量リングに memcpy する。
+constexpr size_t RX_RING_BYTES = 128 * 1024;
 
 } // namespace
 
@@ -43,8 +44,12 @@ public:
 
     bool allocate(size_t bytes) {
         free();
+        // 低遅延な内部 SRAM (DIRAM) を最優先で確保し、取れなければ PSRAM にフォールバック
         buf_ = static_cast<uint8_t*>(
-            heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (buf_ == nullptr) {
+            buf_ = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        }
         if (buf_ == nullptr) {
             buf_ = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
         }
@@ -310,6 +315,7 @@ bool UsbHostSdrClient::read_line(std::string& line_out, uint32_t timeout_ms) {
         return false;
     }
     const uint32_t deadline = millis() + timeout_ms;
+    int spin_count = 0;
     while (static_cast<int32_t>(deadline - millis()) > 0) {
         const int c = impl_->ring.peek_byte();
         if (c < 0) {
@@ -317,9 +323,15 @@ bool UsbHostSdrClient::read_line(std::string& line_out, uint32_t timeout_ms) {
                 connected_ = false;
                 return false;
             }
-            delay(1);
+            if (++spin_count < 40) {
+                esp_rom_delay_us(25);
+            } else {
+                spin_count = 0;
+                taskYIELD();
+            }
             continue;
         }
+        spin_count = 0;
         impl_->ring.drop_byte();
         if (c == '\n') {
             return true;
@@ -337,10 +349,16 @@ bool UsbHostSdrClient::read_bytes(uint8_t* buffer, size_t length, uint32_t timeo
     }
     const uint32_t deadline = millis() + timeout_ms;
     size_t got = 0;
+    int spin_count = 0;
     while (got < length) {
-        got += impl_->ring.read(buffer + got, length - got);
-        if (got >= length) {
-            return true;
+        const size_t n = impl_->ring.read(buffer + got, length - got);
+        if (n > 0) {
+            got += n;
+            spin_count = 0;
+            if (got >= length) {
+                return true;
+            }
+            continue;
         }
         if (static_cast<int32_t>(deadline - millis()) <= 0) {
             return false;
@@ -349,7 +367,12 @@ bool UsbHostSdrClient::read_bytes(uint8_t* buffer, size_t length, uint32_t timeo
             connected_ = false;
             return false;
         }
-        delay(1);
+        if (++spin_count < 40) {
+            esp_rom_delay_us(25);
+        } else {
+            spin_count = 0;
+            taskYIELD();
+        }
     }
     return true;
 }
@@ -380,10 +403,11 @@ bool UsbHostSdrClient::synchronize(uint32_t timeout_ms) {
     // CAP16 のペイロード (バイナリ) を読みかけの状態で 1 行一致を待つと、
     // 0x0A で途中で切れたゴミ行しか得られず復旧できない。直近の受信バイトを
     // 保持したまま "SYNC <nonce>\n" の部分一致を探す。
-    // nonce は単調増加なので、キューに残った古いエコーと誤一致することはない。
+    // 1回の試行を短く (50ms) 刻み、全体で素早く復旧する。
     static uint32_t nonce_counter = 0;
+    const uint32_t attempt_timeout = std::min<uint32_t>(60, std::max<uint32_t>(20, timeout_ms / 6));
 
-    for (int attempt = 0; attempt < 8; ++attempt) {
+    for (int attempt = 0; attempt < 6; ++attempt) {
         const uint64_t nonce = 1000000ULL + (++nonce_counter);
         const std::string marker = "SYNC " + std::to_string(nonce) + "\n";
 
@@ -394,7 +418,7 @@ bool UsbHostSdrClient::synchronize(uint32_t timeout_ms) {
 
         std::string tail;
         uint8_t chunk[256];
-        const uint32_t deadline = millis() + timeout_ms;
+        const uint32_t deadline = millis() + attempt_timeout;
         while (static_cast<int32_t>(deadline - millis()) > 0) {
             const size_t n = read_available(chunk, sizeof(chunk));
             if (n == 0) {
@@ -402,12 +426,10 @@ bool UsbHostSdrClient::synchronize(uint32_t timeout_ms) {
                     connected_ = false;
                     return false;
                 }
-                delay(2);
+                esp_rom_delay_us(100);
                 continue;
             }
             tail.append(reinterpret_cast<const char*>(chunk), n);
-            // マーカー (最大 20 バイト程度) がチャンク境界で分断されても
-            // 見つかるよう、直近 512 バイトは残す
             if (tail.size() > 512) {
                 tail.erase(0, tail.size() - 512);
             }
@@ -418,6 +440,7 @@ bool UsbHostSdrClient::synchronize(uint32_t timeout_ms) {
     }
     return false;
 }
+
 
 void UsbHostSdrClient::close() {
     connected_ = false;
