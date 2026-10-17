@@ -2,6 +2,8 @@
 
 [日本語](#japanese) | [English](#english)
 
+![M5Stack TAB 5 + StampC5 FPV 5.8GHz Band Monitor](images/fpv-monitor-c5-tab5.jpg)
+
 ---
 
 <a name="japanese"></a>
