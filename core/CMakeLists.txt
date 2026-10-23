@@ -18,6 +18,7 @@ set(VTXMON_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/../src")
 # app.cpp / usb_host_sdr.cpp / ui_renderer.cpp は Arduino 依存なので含めない。
 add_library(vtxmon_core STATIC
     "${VTXMON_SRC_DIR}/esp_sdr_protocol.cpp"
+    "${VTXMON_SRC_DIR}/widscan_protocol.cpp"
     "${VTXMON_SRC_DIR}/dsp_stitcher.cpp"
     "${VTXMON_SRC_DIR}/channel_analysis.cpp"
 )

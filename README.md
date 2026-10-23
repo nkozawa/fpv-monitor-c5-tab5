@@ -24,9 +24,11 @@ PC 向け実装（[fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-mo
   - ヘッダー右端の `+` / `-` ボタンで SDR アナログゲインを即座に増減
 - **ケーブル 1 本で直結**:
   - TAB 5 の **USB-A Host ポート** から ESP32-C5 モジュールに 5V 給電し、USB CDC-ACM 仮想シリアルで高速通信
-- **公式 ESP-SDR ファームウェアが必須**:
-  - ESP32-C5 モジュールには公式 ESP-SDR ファームウェアの導入が必須です。生 I/Q データを USB 転送し、8192点 FFT・スティッチング・信号解析・UI描画をすべて TAB 5 (ESP32-P4 @ 400MHz) 側でリアルタイム実行します。
-  - （実験的サポート）FPV-LCD カスタムファームウェア（SWEEP ストリーム転送）接続時にも自動判別して動作可能です。LCD ファームウェアの詳細は [https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5) を参照してください。
+- **Widscan58 および公式 ESP-SDR の両対応（自動判別）**:
+  - **Widscan58 ファームウェア（推奨）**: ESP32-C5 側で高速ホッピング（~4ms/hop）と FFT・メトリクス計算を実行し、約 50〜60 rotations/s の高速かつ滑らかなリアルタイム表示を実現します。
+  - **公式 ESP-SDR ファームウェア**: 生 I/Q データを USB 転送し、8192点 FFT・スティッチング・信号解析・UI描画をすべて TAB 5 (ESP32-P4 @ 400MHz) 側で実行します。
+  - （実験的サポート）FPV-LCD カスタムファームウェア（SWEEP ストリーム転送）接続時にも自動判別して動作可能です。
+  - ※ 接続時にプロトコルを自動判別するため、設定変更なしでどちらのファームウェアでも動作します。
 
 ### 対応ハードウェア
 
@@ -36,15 +38,19 @@ PC 向け実装（[fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-mo
   - **M5Stack StampC5** (ESP32-C5)
   - **Seeed Studio XIAO ESP32-C5**
 
-### ESP32-C5 ファームウェアの準備（必須）
+### ESP32-C5 ファームウェアの準備
 
-ESP32-C5 モジュール（StampC5 または XIAO ESP32-C5）を本システムで使用するには、あらかじめ **ESP-SDR** ファームウェアに変更（書き込み）する必要があります。
+ESP32-C5 モジュール（StampC5 または XIAO ESP32-C5）には、**Widscan58** または **公式 ESP-SDR** ファームウェアを書き込みます。
 
-1. PC の Chrome 等の WebSerial 対応ブラウザで **[ESP-SDR 公式サイト (https://espargos.net/espsdr/)](https://espargos.net/espsdr/)** を開きます。
-2. ESP32-C5 を PC に USB 接続します（ブートボタンを押しながら接続してブートローダに入る必要がある場合があります）。
-3. サイト上の Web インストーラ（または提供されているファームウェアバイナリ）を使用し、**公式 ESP-SDR ファームウェア** に変更・書き込みを行います。
-   > **注意**: ESP32-C5 側で FFT 計算を行うファームウェアではなく、**標準の公式 ESP-SDR ファームウェア（生 I/Q 転送モード）** を使用します。FFT やホップ合成処理はすべて処理能力の高い TAB 5 側で行われます。  
-   > ※ 実験的機能としての FPV-LCD ファームウェアの利用については、[https://github.com/zubon2003/fpv-band-monitor-c5](https://github.com/zubon2003/fpv-band-monitor-c5) を参照してください。
+#### オプション A: Widscan58 ファームウェア（推奨：高速応答 50〜60 fps）
+1. ブラウザで **[Widscan58 Web UI (https://capnbry.github.io/widscan58/)](https://capnbry.github.io/widscan58/)** を開きます。
+2. ESP32-C5 を PC に USB 接続します。
+3. **Flash device** をクリックしてファームウェアをブラウザから直接書き込みます。
+
+#### オプション B: 公式 ESP-SDR ファームウェア
+1. ブラウザで **[ESP-SDR 公式サイト (https://espargos.net/espsdr/)](https://espargos.net/espsdr/)** を開きます。
+2. ESP32-C5 を PC に USB 接続します。
+3. サイト上の Web インストーラを使用し、**公式 ESP-SDR ファームウェア** を書き込みます。
 
 ### ハードウェア接続と役割分担
 
@@ -52,7 +58,7 @@ ESP32-C5 モジュール（StampC5 または XIAO ESP32-C5）を本システム�
 +------------------------------------+           USB-A to Type-C ケーブル           +---------------------------+
 |          M5Stack TAB 5             | -------------------------------------------> |  StampC5 / XIAO ESP32-C5  |
 |  (ESP32-P4 USB Host Controller)    | <==========================================> |   (ESP32-C5 Native USB)   |
-|                                    |       [5V 給電] + [CDC-ACM 仮想シリアル]      |  ESP-SDR 公式ファームウェア  |
+|                                    |       [5V 給電] + [CDC-ACM 仮想シリアル]      |  Widscan58 / ESP-SDR FW   |
 +------------------------------------+                                              +---------------------------+
 ```
 

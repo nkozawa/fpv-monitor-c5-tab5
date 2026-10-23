@@ -5,6 +5,7 @@
 
 #include "types.hpp"
 #include "esp_sdr_protocol.hpp"
+#include "widscan_protocol.hpp"
 #include "dsp_stitcher.hpp"
 #include "channel_analysis.hpp"
 
@@ -271,9 +272,169 @@ void test_stitch_end_to_end() {
     std::cout << "  -> Passed!" << std::endl;
 }
 
+void test_widscan_protocol() {
+    std::cout << "[Test] Widscan58 Protocol & Frames..." << std::endl;
+
+    // 1. コマンド生成
+    assert(WidscanProtocol::cmd_protocol_monitor() == "PROTOCOL MONITOR\n");
+    assert(WidscanProtocol::cmd_info() == "INFO\n");
+    assert(WidscanProtocol::cmd_profile_query() == "PROFILE?\n");
+    assert(WidscanProtocol::cmd_gain_manual(25) == "GAIN MANUAL 25\n");
+    assert(WidscanProtocol::cmd_gain_hardware() == "GAIN HARDWARE\n");
+    assert(WidscanProtocol::cmd_scan_start() == "SCAN START\n");
+    assert(WidscanProtocol::cmd_scan_stop() == "SCAN STOP\n");
+
+    std::vector<ChannelDef> chs = {{"E2", 5665.0f}, {"E1", 5705.0f}};
+    assert(WidscanProtocol::cmd_channels(chs) == "CHANNELS E2=5665 E1=5705\n");
+    assert(WidscanProtocol::cmd_spec(1, 256, 40000000, true) == "SPEC 1 256 40000000 MAX\n");
+
+    // フルバンドスキャン計画の生成テスト
+    std::vector<ChannelDef> active_4ch = {
+        {"E2", 5665.0f},
+        {"E1", 5705.0f},
+        {"F3", 5740.0f},
+        {"F5", 5780.0f}
+    };
+    auto full_plan = WidscanProtocol::build_full_band_plan(active_4ch, 5640.0f, 5800.0f);
+    assert(full_plan.size() == 8); // 最大8チャンネル
+    // 周波数昇順でソートされていること
+    for (size_t i = 1; i < full_plan.size(); ++i) {
+        assert(full_plan[i].freq_mhz >= full_plan[i - 1].freq_mhz);
+    }
+    // 5645〜5800 MHz の全域にわたってチャンネルが存在すること
+    assert(full_plan.front().freq_mhz <= 5650.0f);
+    assert(full_plan.back().freq_mhz >= 5780.0f);
+    // 元の active_4ch がすべて含まれていること
+    for (const auto& a : active_4ch) {
+        bool found = false;
+        for (const auto& p : full_plan) {
+            if (std::abs(p.freq_mhz - a.freq_mhz) < 1.0f) {
+                found = true;
+                break;
+            }
+        }
+        assert(found);
+    }
+
+    // 2. FRAME_METRICS のパース
+    WidscanFrameMetricsHeader mh{};
+    mh.seq = 100;
+    mh.t_ms = 5000;
+    mh.lo_khz = 5685000;
+    mh.tune_us = 400;
+    mh.capture_us = 200;
+    mh.dsp_us = 100;
+    mh.gain = 25;
+    mh.nch = 2;
+
+    WidscanFrameChannel ch0{};
+    ch0.id = 0;
+    ch0.flags = WIDSCAN_CHF_SIGNAL;
+    ch0.rssi_cdb = -4500; // -45.00 dBFS
+    ch0.floor_cdb = -8000; // -80.00 dBFS
+    ch0.snr_cdb = 3500; // 35.00 dB
+    ch0.peak_cdb = -4200;
+    ch0.centroid_off_hz = 150000; // +150 kHz
+    ch0.peak_off_hz = 100000;
+    ch0.obw_lo_khz = -4500;
+    ch0.obw_hi_khz = 4500; // 9 MHz OBW
+
+    WidscanFrameChannel ch1{};
+    ch1.id = 1;
+    ch1.flags = 0; // NO SIGNAL
+    ch1.rssi_cdb = -8200;
+    ch1.snr_cdb = 200;
+
+    // パケット構築: Header + Payload + CRC32
+    std::vector<uint8_t> packet;
+    WidscanHeader hdr{};
+    hdr.sync0 = WIDSCAN_SYNC0;
+    hdr.sync1 = WIDSCAN_SYNC1;
+    hdr.type = FRAME_METRICS;
+    hdr.version = WIDSCAN_PROTO_VERSION;
+    hdr.len = sizeof(WidscanFrameMetricsHeader) + 2 * sizeof(WidscanFrameChannel);
+
+    const uint8_t* p_hdr = reinterpret_cast<const uint8_t*>(&hdr);
+    packet.insert(packet.end(), p_hdr, p_hdr + sizeof(hdr));
+
+    const uint8_t* p_mh = reinterpret_cast<const uint8_t*>(&mh);
+    packet.insert(packet.end(), p_mh, p_mh + sizeof(mh));
+
+    const uint8_t* p_ch0 = reinterpret_cast<const uint8_t*>(&ch0);
+    packet.insert(packet.end(), p_ch0, p_ch0 + sizeof(ch0));
+
+    const uint8_t* p_ch1 = reinterpret_cast<const uint8_t*>(&ch1);
+    packet.insert(packet.end(), p_ch1, p_ch1 + sizeof(ch1));
+
+    uint32_t crc = WidscanProtocol::calculate_crc32(packet.data(), packet.size());
+    packet.push_back(static_cast<uint8_t>(crc & 0xFF));
+    packet.push_back(static_cast<uint8_t>((crc >> 8) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((crc >> 16) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((crc >> 24) & 0xFF));
+
+    // ノイズとテキスト行を混ぜて投入テスト
+    std::vector<uint8_t> noisy_stream;
+    std::string text_line = "OK\n";
+    noisy_stream.insert(noisy_stream.end(), text_line.begin(), text_line.end());
+    noisy_stream.push_back(0x12); // ゴミバイト
+    noisy_stream.insert(noisy_stream.end(), packet.begin(), packet.end());
+
+    WidscanFrameParser parser;
+    bool frame_received = false;
+    bool text_received = false;
+
+    parser.feed(noisy_stream.data(), noisy_stream.size(),
+        [&](const WidscanParsedFrame& f) {
+            assert(f.type == FRAME_METRICS);
+            assert(f.metrics.header.seq == 100);
+            assert(f.metrics.header.lo_khz == 5685000);
+            assert(f.metrics.channels.size() == 2);
+            assert(f.metrics.channels[0].id == 0);
+            assert(f.metrics.channels[0].flags == WIDSCAN_CHF_SIGNAL);
+            assert(f.metrics.channels[0].centroid_off_hz == 150000);
+            assert(f.metrics.channels[0].snr_cdb == 3500);
+            assert(f.metrics.channels[1].id == 1);
+            assert(f.metrics.channels[1].flags == 0);
+            frame_received = true;
+        },
+        [&](const std::string& line) {
+            if (line == "OK") {
+                text_received = true;
+            }
+        });
+
+    assert(text_received);
+    assert(frame_received);
+    assert(parser.valid_frames() == 1);
+    assert(parser.crc_errors() == 0);
+
+    // 3. WidscanSpectrumComposite テスト
+    WidscanSpectrumComposite comp(5640.0f, 5800.0f, 100000.0f); // 160MHz, 100kHz bin
+    // LO 5685 MHz (5665〜5705 付近をカバー)
+    // 256 bins, bin_hz = 78125 Hz (~20 MHz span)
+    std::vector<uint8_t> codes(256, 100); // 100 / 2 - 127.5 = -77.5 dBFS (ノイズ)
+    // 5665 MHz 付近 (LO 5685 - 20 MHz) にピークを置く
+    codes[0] = 200; // 200 / 2 - 127.5 = -27.5 dBFS
+    comp.update_segment(5685000, -10000000, 78125, codes.data(), codes.size());
+
+    SweepFrame sf;
+    comp.compose(sf);
+    assert(sf.powers_db.size() == 1600);
+    assert(sf.start_mhz == 5640.0f);
+    assert(sf.bin_hz == 100000.0f);
+
+    // 5685 MHz 付近は値が入っていること (NaN ではない)
+    int bin_5685 = static_cast<int>((5685.0f - 5640.0f) / 0.1f);
+    assert(!std::isnan(sf.powers_db[bin_5685]));
+    assert(sf.powers_db[bin_5685] > -80.0f);
+
+    std::cout << "  -> Passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running VTX Monitor Core Tests ===" << std::endl;
     test_protocol_commands();
+    test_widscan_protocol();
     test_unpack_iq();
     test_dsp_stitcher();
     test_stitch_end_to_end();

@@ -7,6 +7,7 @@
 #include "channel_analysis.hpp"
 #include "dsp_stitcher.hpp"
 #include "esp_sdr_protocol.hpp"
+#include "widscan_protocol.hpp"
 #include "types.hpp"
 #include "usb_host_sdr.hpp"
 
@@ -307,6 +308,178 @@ void run_fft_stream_mode(UsbHostSdrClient& client, UiSharedState& state) {
     }
 }
 
+// パターン3: Widscan58 ファームウェア (ESP32-C5 側で高速ホッピング & FFT & メトリクス計算)
+void run_widscan_mode(UsbHostSdrClient& client, UiSharedState& state) {
+    ESP_LOGI(TAG, "entering Widscan58 mode");
+
+    // 5640〜5800 MHz の全帯域を隙間なくカバーするチャンネル計画を生成
+    auto scan_plan = WidscanProtocol::build_full_band_plan(
+        state.active_channels, BAND_START_MHZ, BAND_STOP_MHZ);
+
+    std::string ch_cmd = WidscanProtocol::cmd_channels(scan_plan);
+    if (!ask(client, ch_cmd, 300)) {
+        ESP_LOGW(TAG, "CHANNELS command failed: %s", ch_cmd.c_str());
+    } else {
+        ESP_LOGI(TAG, "sent wide CHANNELS: %s", ch_cmd.c_str());
+    }
+
+    // scan_plan の各インデックス (0..scan_plan.size()-1) から
+    // state.active_channels (0..3) への逆引きインデックスを構築
+    std::vector<int> plan_to_active(scan_plan.size(), -1);
+    for (size_t i = 0; i < scan_plan.size(); ++i) {
+        for (size_t j = 0; j < state.active_channels.size(); ++j) {
+            if (std::abs(scan_plan[i].freq_mhz - state.active_channels[j].freq_mhz) < 2.0f) {
+                plan_to_active[i] = static_cast<int>(j);
+                break;
+            }
+        }
+    }
+
+    int initial_gain = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        initial_gain = state.current_gain;
+    }
+    if (initial_gain < 0) {
+        ask(client, WidscanProtocol::cmd_gain_hardware(), 300);
+    } else {
+        ask(client, WidscanProtocol::cmd_gain_manual(initial_gain), 300);
+    }
+
+    // スペクトラム設定: 毎ホップ (every=1), 256 bins, span 40MHz (40000000 = C5 usable_hz 全幅), MAX detector
+    ask(client, WidscanProtocol::cmd_spec(1, 256, 40000000, true), 300);
+
+    // スキャン開始
+    if (!ask(client, WidscanProtocol::cmd_scan_start(), 500)) {
+        ESP_LOGE(TAG, "SCAN START failed");
+        return;
+    }
+
+    WidscanFrameParser parser;
+    WidscanSpectrumComposite composite(BAND_START_MHZ, BAND_STOP_MHZ, 100000.0f /* 100 kHz bin */);
+
+    std::vector<ChannelMeasurement> measurements(state.active_channels.size());
+    for (size_t i = 0; i < state.active_channels.size(); ++i) {
+        measurements[i].name = state.active_channels[i].name;
+        measurements[i].nominal_mhz = state.active_channels[i].freq_mhz;
+        measurements[i].present = false;
+        measurements[i].reason = "WAITING";
+    }
+
+    uint32_t seq = 0;
+    uint32_t last_ui_update_ms = millis();
+    uint32_t last_log_ms = millis();
+    float current_fps = 0.0f;
+    uint32_t frames_received = 0;
+    uint32_t last_fps_calc_ms = millis();
+    uint32_t frames_since_fps = 0;
+
+    std::vector<uint8_t> rx_buf(2048);
+
+    while (client.is_connected()) {
+        // ゲイン変更のチェック
+        bool gain_changed = false;
+        int gain_value = 0;
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            if (state.request_gain_change) {
+                state.current_gain = state.requested_gain;
+                state.request_gain_change = false;
+                gain_changed = true;
+                gain_value = state.current_gain;
+            }
+        }
+        if (gain_changed) {
+            if (gain_value < 0) {
+                ask(client, WidscanProtocol::cmd_gain_hardware(), 200);
+            } else {
+                ask(client, WidscanProtocol::cmd_gain_manual(gain_value), 200);
+            }
+        }
+
+        // ノンブロッキングで利用可能なバイトを読み出し
+        size_t n_read = client.read_available(rx_buf.data(), rx_buf.size());
+        if (n_read == 0) {
+            sleep_ms(2);
+            continue;
+        }
+
+        parser.feed(rx_buf.data(), n_read, [&](const WidscanParsedFrame& frame) {
+            if (frame.type == FRAME_METRICS) {
+                ++frames_received;
+                ++frames_since_fps;
+                const auto& mf = frame.metrics;
+                for (uint8_t c = 0; c < mf.header.nch; ++c) {
+                    const auto& ch = mf.channels[c];
+                    if (ch.id < plan_to_active.size()) {
+                        const int active_idx = plan_to_active[ch.id];
+                        if (active_idx >= 0 && static_cast<size_t>(active_idx) < measurements.size()) {
+                            auto& m = measurements[active_idx];
+                            m.name = state.active_channels[active_idx].name;
+                            m.nominal_mhz = state.active_channels[active_idx].freq_mhz;
+                            m.present = (ch.flags & WIDSCAN_CHF_SIGNAL) != 0;
+                            m.offset_mhz = static_cast<float>(ch.centroid_off_hz) / 1e6f;
+                            m.centre_mhz = m.nominal_mhz + m.offset_mhz;
+                            m.peak_mhz = m.nominal_mhz + (static_cast<float>(ch.peak_off_hz) / 1e6f);
+                            m.peak_dbm = static_cast<float>(ch.peak_cdb) / 100.0f;
+                            m.floor_dbm = static_cast<float>(ch.floor_cdb) / 100.0f;
+                            m.snr_db = static_cast<float>(ch.snr_cdb) / 100.0f;
+                            m.bw_db3_mhz = static_cast<float>(ch.obw_hi_khz - ch.obw_lo_khz) / 1000.0f;
+                            m.bw_db20_mhz = m.bw_db3_mhz;
+                            if (!m.present) {
+                                m.reason = "NO SIG";
+                            } else {
+                                m.reason.clear();
+                            }
+                        }
+                    }
+                }
+            } else if (frame.type == FRAME_SPECTRUM) {
+                const auto& sf = frame.spectrum;
+                composite.update_segment(sf.header.lo_khz, sf.header.start_off_hz,
+                                         sf.header.bin_hz, sf.codes.data(), sf.codes.size());
+            } else if (frame.type == FRAME_TELEMETRY) {
+                const auto& tf = frame.telemetry;
+                if (tf.rotation_mhz > 0) {
+                    current_fps = static_cast<float>(tf.rotation_mhz) / 1000.0f;
+                }
+            }
+        });
+
+        const uint32_t now = millis();
+        if (now - last_fps_calc_ms >= 1000) {
+            if (current_fps <= 0.0f) {
+                current_fps = static_cast<float>(frames_since_fps) * 1000.0f / (now - last_fps_calc_ms);
+            }
+            frames_since_fps = 0;
+            last_fps_calc_ms = now;
+        }
+
+        // 画面更新 (約 60fps 間隔: 16ms)
+        if (now - last_ui_update_ms >= 16) {
+            last_ui_update_ms = now;
+            SweepFrame frame;
+            frame.seq = ++seq;
+            composite.compose(frame);
+
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.latest_frame = std::move(frame);
+            state.measurements = measurements;
+            state.sweep_fps = current_fps;
+        }
+
+        if (now - last_log_ms >= 2000) {
+            ESP_LOGI(TAG, "widscan58: %.1f fps (frames=%u valid=%u crc_err=%u resyncs=%u overrun=%u)",
+                     (double)current_fps, (unsigned)frames_received,
+                     (unsigned)parser.valid_frames(), (unsigned)parser.crc_errors(),
+                     (unsigned)parser.resyncs(), (unsigned)client.overrun_count());
+            last_log_ms = now;
+        }
+    }
+
+    ask(client, WidscanProtocol::cmd_scan_stop(), 200);
+}
+
 } // namespace
 
 UiSharedState& app_state() { return g_ui_state; }
@@ -348,33 +521,55 @@ void app_sdr_worker(void* /*arg*/) {
 
         client.synchronize(500);
 
-        // プロトコル自動判別: FPV? に応答があれば液晶版ファームウェア
-        client.send_command(EspSdrProtocol::cmd_fpv_probe());
-        std::string reply;
-        const bool is_fpv_fw = client.read_line(reply, 500) && reply.rfind("FPV ", 0) == 0;
-        ESP_LOGI(TAG, "FPV? probe -> '%s' (%s firmware)", reply.c_str(),
-                 is_fpv_fw ? "FPV-LCD" : "official ESP-SDR");
-
-        // 素性確認。PC 版は INFO が "C5SDR" で始まることを要求している
-        // (5.8 GHz 帯は ESP32-C5 でないとチューニングできない)。
+        // プロトコル自動判別
+        // 1. Widscan58 ファームウェアの判定:
+        //    起動時は RotorHazard モードで無言のため、PROTOCOL MONITOR を送って OK が返るか確認
+        bool is_widscan = false;
         std::string info_line;
-        if (client.send_command(EspSdrProtocol::cmd_info()) &&
-            client.read_line(info_line, 500)) {
-            ESP_LOGI(TAG, "device INFO: %s", info_line.c_str());
-        } else {
-            ESP_LOGW(TAG, "no INFO reply - is the ESP-SDR firmware flashed?");
+        if (ask(client, WidscanProtocol::cmd_protocol_monitor(), 300)) {
+            client.send_command(WidscanProtocol::cmd_info());
+            if (client.read_line(info_line, 300) && info_line.find("widscan58") != std::string::npos) {
+                is_widscan = true;
+                ESP_LOGI(TAG, "detected Widscan58 firmware: %s", info_line.c_str());
+            }
+        }
+
+        bool is_fpv_fw = false;
+        if (!is_widscan) {
+            // 2. FPV-LCD ファームウェアの判定: FPV? に応答があるか
+            client.send_command(EspSdrProtocol::cmd_fpv_probe());
+            std::string reply;
+            is_fpv_fw = client.read_line(reply, 300) && reply.rfind("FPV ", 0) == 0;
+            ESP_LOGI(TAG, "FPV? probe -> '%s' (%s firmware)", reply.c_str(),
+                     is_fpv_fw ? "FPV-LCD" : "official ESP-SDR");
+
+            // 3. 公式 ESP-SDR: 素性確認 (INFO が "C5SDR" 等)
+            if (client.send_command(EspSdrProtocol::cmd_info()) &&
+                client.read_line(info_line, 300)) {
+                ESP_LOGI(TAG, "device INFO: %s", info_line.c_str());
+            } else {
+                ESP_LOGW(TAG, "no INFO reply - is the ESP-SDR firmware flashed?");
+            }
         }
 
         {
             std::lock_guard<std::mutex> lock(g_ui_state.mtx);
             g_ui_state.connected = true;
-            g_ui_state.rx_mode = is_fpv_fw ? "fft (Stream)" : "iq (Raw I/Q)";
-            g_ui_state.device_info = client.device_info();
+            if (is_widscan) {
+                g_ui_state.rx_mode = "widscan (Widscan58)";
+            } else if (is_fpv_fw) {
+                g_ui_state.rx_mode = "fft (Stream)";
+            } else {
+                g_ui_state.rx_mode = "iq (Raw I/Q)";
+            }
+            g_ui_state.device_info = info_line.empty() ? client.device_info() : info_line;
         }
-        ESP_LOGI(TAG, "connected: %s mode=%s", client.device_info().c_str(),
-                 is_fpv_fw ? "fft-stream" : "raw-iq");
+        ESP_LOGI(TAG, "connected: %s mode=%s", g_ui_state.device_info.c_str(),
+                 g_ui_state.rx_mode.c_str());
 
-        if (is_fpv_fw) {
+        if (is_widscan) {
+            run_widscan_mode(client, g_ui_state);
+        } else if (is_fpv_fw) {
             run_fft_stream_mode(client, g_ui_state);
         } else {
             run_raw_iq_mode(client, stitcher, g_ui_state);
